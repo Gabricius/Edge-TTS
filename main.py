@@ -11,7 +11,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Edge-TTS Microservice", version="1.4.0")
+app = FastAPI(title="Edge-TTS Microservice", version="1.5.0")
 
 class TTSRequest(BaseModel):
     text: str = Field(..., min_length=1)
@@ -19,23 +19,16 @@ class TTSRequest(BaseModel):
     rate: str = "+0%"
     pitch: str = "+0Hz"
 
-def clean_param(param):
-    """Remove parâmetros neutros que podem causar erro na API"""
-    if param in ["+0%", "-0%", "+0Hz", "-0Hz"]:
-        return None
-    return param
-
-# --- ROTA DA PÁGINA INICIAL (Resolve o erro "Not Found" no navegador) ---
+# --- ROTA HOME ---
 @app.get("/")
 def home():
-    return {"status": "online", "message": "O serviço Edge-TTS está rodando! Use o endpoint /generate (POST) no n8n."}
+    return {"status": "online", "message": "Serviço Ativo. Use POST em /generate"}
 
-# --- ROTA PARA LISTAR VOZES (Para você consultar no navegador) ---
+# --- ROTA DE VOZES ---
 @app.get("/voices")
 async def list_voices():
     try:
         voices = await edge_tts.list_voices()
-        # Filtra para mostrar apenas as vozes neurais principais
         curated = [
             {"Name": v["ShortName"], "Gender": v["Gender"], "Locale": v["Locale"]}
             for v in voices if "Neural" in v["ShortName"]
@@ -44,21 +37,19 @@ async def list_voices():
     except Exception as e:
         return {"error": str(e)}
 
-# --- ROTA PRINCIPAL DE GERAÇÃO (Usada pelo n8n) ---
+# --- ROTA DE GERAÇÃO ---
 @app.post("/generate")
 async def generate_speech(request: TTSRequest):
     logger.info(f"--- Novo Pedido ---")
-    logger.info(f"Texto (inicio): {request.text[:50]}...")
+    logger.info(f"Voz: {request.voice} | Rate: {request.rate}")
     
     try:
-        final_rate = clean_param(request.rate)
-        final_pitch = clean_param(request.pitch)
-
+        # Passamos os parâmetros DIRETAMENTE (sem transformar em None)
         communicate = edge_tts.Communicate(
             text=request.text, 
             voice=request.voice, 
-            rate=final_rate, 
-            pitch=final_pitch
+            rate=request.rate, 
+            pitch=request.pitch
         )
         
         audio_buffer = io.BytesIO()
@@ -73,28 +64,26 @@ async def generate_speech(request: TTSRequest):
                 submaker.feed(chunk)
                 message_counts["WordBoundary"] += 1
 
-        logger.info(f"Stream finalizado. Audio chunks: {message_counts['audio']}, Legenda events: {message_counts['WordBoundary']}")
+        logger.info(f"Stream OK. Chunks: {message_counts['audio']} | Legendas: {message_counts['WordBoundary']}")
 
-        # Prepara Audio
+        # 1. Processa Áudio
         audio_buffer.seek(0)
         audio_base64 = base64.b64encode(audio_buffer.read()).decode('utf-8')
         
-        # Prepara Legenda
+        # 2. Processa Legenda
         srt_content = ""
         if message_counts["WordBoundary"] > 0:
             try:
+                # Gera o VTT nativo
                 srt_content = submaker.generate_subs()
-                # Remove cabeçalho WEBVTT se existir e ajusta formato se necessário
-                # O edge-tts mais novo já gera VTT limpo, mas o n8n precisa de SRT
-                # Converter VTT para SRT simples (trocar ponto por virgula no tempo)
-                # Mas para simplificar, vamos enviar o que vier e tratar no n8n se precisar,
-                # ou fazer um replace simples aqui:
+                # Limpa cabeçalho VTT para parecer mais com SRT
                 srt_content = srt_content.replace("WEBVTT\n\n", "")
             except Exception as e:
-                logger.error(f"Erro ao gerar legenda: {e}")
-                srt_content = "1\n00:00:00,000 --> 00:00:05,000\nErro na geração da legenda."
+                logger.error(f"Erro ao processar legenda: {e}")
+                srt_content = f"1\n00:00:00,000 --> 00:00:05,000\n{request.text}"
         else:
-            # Fallback se a Microsoft não mandar tempos
+            # Fallback se não vierem tempos
+            logger.warning("Sem dados de tempo da Microsoft. Usando legenda forçada.")
             srt_content = f"1\n00:00:00,000 --> 00:00:05,000\n{request.text}"
 
         srt_base64 = base64.b64encode(srt_content.encode('utf-8')).decode('utf-8')
@@ -110,6 +99,7 @@ async def generate_speech(request: TTSRequest):
 
     except Exception as e:
         logger.error(f"Erro Fatal: {str(e)}")
+        # Retorna o erro exato para o n8n
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
