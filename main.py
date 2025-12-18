@@ -8,11 +8,16 @@ from pydantic import BaseModel, Field
 import edge_tts
 import uvicorn
 
-# Configuração de Logs
+# --- CONFIGURAÇÃO DE CALIBRAÇÃO ---
+# Se a legenda ficar curta demais, AUMENTE este número.
+# Se ficar longa demais, DIMINUA.
+# 50 = Rápido | 72 = Normal/Francisca | 85 = Vozes Lentas
+MS_PER_CHAR_ESTIMATE = 72 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Edge-TTS Pro", version="5.0.0 (Math-Sync)")
+app = FastAPI(title="Edge-TTS Pro", version="6.0.0 (Calibrated)")
 
 class TTSRequest(BaseModel):
     text: str = Field(..., min_length=1)
@@ -31,55 +36,49 @@ def format_srt_time(ticks):
 
 def estimate_word_timings(text, start_offset, duration_ticks):
     """
-    MÁGICA MATEMÁTICA:
-    Se a API não mandar os tempos, nós dividimos a duração do áudio
-    pelo número de palavras e criamos eventos artificiais.
-    Isso impede que a legenda vire um bloco gigante.
+    Distribui o tempo total do áudio proporcionalmente pelo número de letras de cada palavra.
+    Isso é mais preciso que dividir igualmente por palavra.
     """
     words = text.split()
     if not words: return []
     
-    word_count = len(words)
-    time_per_word = duration_ticks / word_count
+    total_chars = sum(len(w) for w in words)
+    if total_chars == 0: total_chars = 1
     
     simulated_events = []
     current_offset = start_offset
     
     for word in words:
+        # Calcula duração da palavra baseada no nº de letras dela
+        word_weight = len(word) / total_chars
+        word_duration = duration_ticks * word_weight
+        
         simulated_events.append({
             "offset": current_offset,
-            "duration": time_per_word,
+            "duration": word_duration,
             "text": word
         })
-        current_offset += time_per_word
+        current_offset += word_duration
         
     return simulated_events
 
-def group_words_to_captions(events, max_words=5): # Reduzi para 5 para ficar mais dinâmico
-    """Agrupa palavras (reais ou simuladas) em frases curtas"""
+def group_words_to_captions(events, max_words=5):
     if not events: return []
-
     captions = []
     current_chunk = []
     
     for event in events:
         current_chunk.append(event)
-        
-        # Lógica de quebra: Pontuação ou limite de palavras
         text_content = event.get('text', '').strip()
         is_end_sentence = text_content and text_content[-1] in ['.', '?', '!', ':']
         
-        # Quebra se tiver 5 palavras OU (pelo menos 2 palavras E fim de frase)
         if len(current_chunk) >= max_words or (len(current_chunk) >= 2 and is_end_sentence):
             start = current_chunk[0]['offset']
-            # O fim é o offset da última palavra + duração dela
             end = current_chunk[-1]['offset'] + current_chunk[-1]['duration']
             text = " ".join([e['text'] for e in current_chunk])
-            
             captions.append({"start": start, "end": end, "text": text})
             current_chunk = []
     
-    # Processa o que sobrou
     if current_chunk:
         start = current_chunk[0]['offset']
         end = current_chunk[-1]['offset'] + current_chunk[-1]['duration']
@@ -100,12 +99,11 @@ def generate_srt_string(captions):
     return "\n".join(output)
 
 async def generate_segment(text, voice, rate, pitch, retries=2):
-    """Gera áudio para um micro-segmento"""
     for attempt in range(retries + 1):
         try:
             safe_rate = rate if rate else "+0%"
             safe_pitch = pitch if pitch else "+0Hz"
-
+            
             communicate = edge_tts.Communicate(text, voice, rate=safe_rate, pitch=safe_pitch)
             audio_buffer = io.BytesIO()
             events = []
@@ -116,7 +114,6 @@ async def generate_segment(text, voice, rate, pitch, retries=2):
                 elif chunk["type"] == "WordBoundary":
                     events.append(chunk)
             
-            # Se vier áudio mas sem eventos, retorna lista vazia de eventos (para tratarmos depois)
             if audio_buffer.getbuffer().nbytes > 0 and not events:
                 if attempt < retries:
                     await asyncio.sleep(0.5)
@@ -132,13 +129,12 @@ async def generate_segment(text, voice, rate, pitch, retries=2):
 
 @app.post("/generate")
 async def generate_speech(request: TTSRequest):
-    logger.info(f"--- Processando V5.0 ({len(request.text)} chars) ---")
+    logger.info(f"--- Processando V6.0 ({len(request.text)} chars) ---")
     
-    # 1. DIVISÃO: Mantemos 250 chars para não sobrecarregar
+    # 1. DIVISÃO: 250 chars
     raw_sentences = re.split(r'(?<=[.?!])\s+', request.text)
     segments = []
     current_chunk = ""
-    
     for s in raw_sentences:
         if len(current_chunk) + len(s) < 250:
             current_chunk += s + " "
@@ -155,48 +151,36 @@ async def generate_speech(request: TTSRequest):
         for i, seg in enumerate(segments):
             if not seg.strip(): continue
             
-            # Gera o segmento
             seg_audio, seg_events = await generate_segment(seg, request.voice, request.rate, request.pitch)
-            
-            # Calcula duração deste áudio em ticks (1 segundo = 32000 bytes aprox em mp3? Não, varia.)
-            # Melhor usar o tamanho do áudio para estimar duração se não tiver eventos? 
-            # Não, vamos confiar no fluxo.
-            
             full_audio.write(seg_audio)
             
-            # Duração Estimada do segmento (caso precise)
-            # 1 char ~= 50ms é uma boa média para fala normal
-            estimated_duration_ticks = len(seg) * 500_000 
-            
+            # --- LÓGICA DE SINCRONIA ---
             if seg_events:
-                # CENÁRIO IDEAL: Microsoft mandou os tempos
-                # Pega a duração real baseada no último evento
+                # Caso ideal: Microsoft mandou tempos
                 last = seg_events[-1]
-                real_duration = last['offset'] + last['duration']
-                
+                # Adiciona offset global
                 for event in seg_events:
                     event['offset'] += global_offset
                     all_events.append(event)
-                
-                # Atualiza relógio
-                global_offset += real_duration + 500_000 # +50ms pausa
-                
+                global_offset = last['offset'] + last['duration'] + 500_000 
             else:
-                # CENÁRIO DE FALHA (Aqui estava o problema antes)
-                logger.warning(f"Segmento {i} sem WordBoundary. Simulando tempos.")
+                # Caso Fallback: Microsoft falhou
+                logger.warning(f"Segmento {i} usando estimativa calibrada ({MS_PER_CHAR_ESTIMATE}ms/char).")
                 
-                # Usa a função matemática para quebrar o texto em palavras
-                simulated = estimate_word_timings(seg, global_offset, estimated_duration_ticks)
+                # CALIBRAÇÃO AQUI:
+                # Transforma ms em ticks (1ms = 10,000 ticks)
+                ticks_per_char = MS_PER_CHAR_ESTIMATE * 10_000
+                estimated_duration = len(seg) * ticks_per_char
+                
+                # Gera eventos simulados proporcionais
+                simulated = estimate_word_timings(seg, global_offset, estimated_duration)
                 all_events.extend(simulated)
                 
-                global_offset += estimated_duration_ticks + 500_000
+                global_offset += estimated_duration + 500_000 # +50ms pausa
 
             await asyncio.sleep(0.1)
 
-        # 2. AGRUPAMENTO (Agora sempre terá palavras individuais para agrupar)
         grouped_captions = group_words_to_captions(all_events, max_words=5)
-        
-        # 3. GERAÇÃO FINAL
         srt_content = generate_srt_string(grouped_captions)
         
         if not srt_content:
@@ -207,7 +191,7 @@ async def generate_speech(request: TTSRequest):
             "data": {
                 "audio_base64": base64.b64encode(full_audio.getvalue()).decode('utf-8'),
                 "srt_base64": base64.b64encode(srt_content.encode('utf-8')).decode('utf-8'),
-                "metadata": {"mode": "v5_math_sync", "segments": len(segments)}
+                "metadata": {"mode": "calibrated", "ms_per_char": MS_PER_CHAR_ESTIMATE}
             }
         }
 
