@@ -12,7 +12,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Edge-TTS Pro", version="4.0.0 (Micro-Batch)")
+app = FastAPI(title="Edge-TTS Pro", version="5.0.0 (Math-Sync)")
 
 class TTSRequest(BaseModel):
     text: str = Field(..., min_length=1)
@@ -21,7 +21,7 @@ class TTSRequest(BaseModel):
     pitch: str = "+0Hz"
 
 def format_srt_time(ticks):
-    """Converte tempo Microsoft (ticks) para SRT"""
+    """Converte ticks (100ns) para formato SRT"""
     seconds = ticks / 10_000_000
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
@@ -29,8 +29,34 @@ def format_srt_time(ticks):
     millis = int((seconds - int(seconds)) * 1000)
     return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
 
-def group_words_to_captions(events, max_words=6):
-    """Agrupa palavras em frases curtas (4-6 palavras)"""
+def estimate_word_timings(text, start_offset, duration_ticks):
+    """
+    MÁGICA MATEMÁTICA:
+    Se a API não mandar os tempos, nós dividimos a duração do áudio
+    pelo número de palavras e criamos eventos artificiais.
+    Isso impede que a legenda vire um bloco gigante.
+    """
+    words = text.split()
+    if not words: return []
+    
+    word_count = len(words)
+    time_per_word = duration_ticks / word_count
+    
+    simulated_events = []
+    current_offset = start_offset
+    
+    for word in words:
+        simulated_events.append({
+            "offset": current_offset,
+            "duration": time_per_word,
+            "text": word
+        })
+        current_offset += time_per_word
+        
+    return simulated_events
+
+def group_words_to_captions(events, max_words=5): # Reduzi para 5 para ficar mais dinâmico
+    """Agrupa palavras (reais ou simuladas) em frases curtas"""
     if not events: return []
 
     captions = []
@@ -43,7 +69,8 @@ def group_words_to_captions(events, max_words=6):
         text_content = event.get('text', '').strip()
         is_end_sentence = text_content and text_content[-1] in ['.', '?', '!', ':']
         
-        if len(current_chunk) >= max_words or (len(current_chunk) >= 3 and is_end_sentence):
+        # Quebra se tiver 5 palavras OU (pelo menos 2 palavras E fim de frase)
+        if len(current_chunk) >= max_words or (len(current_chunk) >= 2 and is_end_sentence):
             start = current_chunk[0]['offset']
             # O fim é o offset da última palavra + duração dela
             end = current_chunk[-1]['offset'] + current_chunk[-1]['duration']
@@ -52,7 +79,7 @@ def group_words_to_captions(events, max_words=6):
             captions.append({"start": start, "end": end, "text": text})
             current_chunk = []
     
-    # Processa o que sobrou no buffer
+    # Processa o que sobrou
     if current_chunk:
         start = current_chunk[0]['offset']
         end = current_chunk[-1]['offset'] + current_chunk[-1]['duration']
@@ -76,7 +103,6 @@ async def generate_segment(text, voice, rate, pitch, retries=2):
     """Gera áudio para um micro-segmento"""
     for attempt in range(retries + 1):
         try:
-            # Garante strings limpas
             safe_rate = rate if rate else "+0%"
             safe_pitch = pitch if pitch else "+0Hz"
 
@@ -90,13 +116,13 @@ async def generate_segment(text, voice, rate, pitch, retries=2):
                 elif chunk["type"] == "WordBoundary":
                     events.append(chunk)
             
-            # Validação crítica: Se veio áudio mas sem legenda, é falha.
+            # Se vier áudio mas sem eventos, retorna lista vazia de eventos (para tratarmos depois)
             if audio_buffer.getbuffer().nbytes > 0 and not events:
                 if attempt < retries:
                     await asyncio.sleep(0.5)
                     continue 
                 else:
-                    return audio_buffer.getvalue(), [] # Desiste e entrega sem legenda
+                    return audio_buffer.getvalue(), [] 
             
             return audio_buffer.getvalue(), events
             
@@ -106,16 +132,14 @@ async def generate_segment(text, voice, rate, pitch, retries=2):
 
 @app.post("/generate")
 async def generate_speech(request: TTSRequest):
-    logger.info(f"--- Processando V4.0 ({len(request.text)} chars) ---")
+    logger.info(f"--- Processando V5.0 ({len(request.text)} chars) ---")
     
-    # 1. DIVISÃO MICRO-BATCH (Limite 250 chars)
-    # Isso força o envio frase a frase, garantindo que a Microsoft mande os tempos.
+    # 1. DIVISÃO: Mantemos 250 chars para não sobrecarregar
     raw_sentences = re.split(r'(?<=[.?!])\s+', request.text)
     segments = []
     current_chunk = ""
     
     for s in raw_sentences:
-        # Se a frase atual + a nova frase for menor que 250, agrupa
         if len(current_chunk) + len(s) < 250:
             current_chunk += s + " "
         else:
@@ -131,38 +155,45 @@ async def generate_speech(request: TTSRequest):
         for i, seg in enumerate(segments):
             if not seg.strip(): continue
             
-            # Gera o micro-segmento
+            # Gera o segmento
             seg_audio, seg_events = await generate_segment(seg, request.voice, request.rate, request.pitch)
+            
+            # Calcula duração deste áudio em ticks (1 segundo = 32000 bytes aprox em mp3? Não, varia.)
+            # Melhor usar o tamanho do áudio para estimar duração se não tiver eventos? 
+            # Não, vamos confiar no fluxo.
             
             full_audio.write(seg_audio)
             
+            # Duração Estimada do segmento (caso precise)
+            # 1 char ~= 50ms é uma boa média para fala normal
+            estimated_duration_ticks = len(seg) * 500_000 
+            
             if seg_events:
-                # Ajusta os tempos relativos para absolutos
+                # CENÁRIO IDEAL: Microsoft mandou os tempos
+                # Pega a duração real baseada no último evento
+                last = seg_events[-1]
+                real_duration = last['offset'] + last['duration']
+                
                 for event in seg_events:
                     event['offset'] += global_offset
                     all_events.append(event)
                 
-                # Atualiza o relógio global com precisão
-                last = seg_events[-1]
-                # Adiciona um micro-silêncio (50ms) para não atropelar
-                global_offset = last['offset'] + last['duration'] + 500_000 
-            else:
-                # Fallback Ajustado (50ms por char em vez de 80ms)
-                # Só entra aqui se a API da Microsoft falhar totalmente nesse trecho
-                duration = len(seg) * 500_000 
+                # Atualiza relógio
+                global_offset += real_duration + 500_000 # +50ms pausa
                 
-                # Cria evento falso para não quebrar a legenda
-                all_events.append({
-                    "offset": global_offset,
-                    "duration": duration,
-                    "text": seg
-                })
-                global_offset += duration
+            else:
+                # CENÁRIO DE FALHA (Aqui estava o problema antes)
+                logger.warning(f"Segmento {i} sem WordBoundary. Simulando tempos.")
+                
+                # Usa a função matemática para quebrar o texto em palavras
+                simulated = estimate_word_timings(seg, global_offset, estimated_duration_ticks)
+                all_events.extend(simulated)
+                
+                global_offset += estimated_duration_ticks + 500_000
 
-            # Pausa mínima para evitar 429 Too Many Requests
             await asyncio.sleep(0.1)
 
-        # 2. AGRUPAMENTO (Onde a mágica visual acontece)
+        # 2. AGRUPAMENTO (Agora sempre terá palavras individuais para agrupar)
         grouped_captions = group_words_to_captions(all_events, max_words=5)
         
         # 3. GERAÇÃO FINAL
@@ -176,7 +207,7 @@ async def generate_speech(request: TTSRequest):
             "data": {
                 "audio_base64": base64.b64encode(full_audio.getvalue()).decode('utf-8'),
                 "srt_base64": base64.b64encode(srt_content.encode('utf-8')).decode('utf-8'),
-                "metadata": {"segments": len(segments), "voice": request.voice}
+                "metadata": {"mode": "v5_math_sync", "segments": len(segments)}
             }
         }
 
